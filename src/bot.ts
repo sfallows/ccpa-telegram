@@ -9,6 +9,8 @@ import {
   textHandler,
   voiceHandler,
 } from "./bot/handlers/index.js";
+import { processMessage } from "./bot/handlers/text.js";
+import { initMessageBuffer } from "./bot/messageBuffer.js";
 import { authMiddleware } from "./bot/middleware/auth.js";
 import { rateLimitMiddleware } from "./bot/middleware/rateLimit.js";
 import { getConfig, getWorkingDirectory } from "./config.js";
@@ -44,6 +46,15 @@ export async function startBot(): Promise<void> {
 
   logger.info({ workingDir }, "Working directory");
   logger.info({ dataDir: config.dataDir }, "Data directory");
+
+  // Initialize message buffer
+  initMessageBuffer(config.messageBufferMs, processMessage);
+  if (config.messageBufferMs > 0) {
+    logger.info(
+      { delayMs: config.messageBufferMs },
+      "Message buffering enabled",
+    );
+  }
 
   // Verify Claude CLI is available
   logger.debug({ command: config.claude.command }, "Checking Claude CLI");

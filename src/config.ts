@@ -63,6 +63,7 @@ const ConfigSchema = z.object({
   claude: z.object({
     command: z.string().default("claude"),
   }),
+  messageBufferMs: z.number().nonnegative().default(0),
   transcription: z
     .object({
       model: TranscriptionModelSchema.default("base.en"),
@@ -106,6 +107,7 @@ const ConfigFileSchema = z
       })
       .partial()
       .optional(),
+    messageBufferMs: z.number().nonnegative().optional(),
     transcription: z
       .object({
         model: TranscriptionModelSchema.default("base.en"),
@@ -192,6 +194,9 @@ export function loadConfig(): Config {
       command:
         process.env.CLAUDE_COMMAND || fileConfig.claude?.command || "claude",
     },
+    messageBufferMs: process.env.MESSAGE_BUFFER_MS
+      ? parseInt(process.env.MESSAGE_BUFFER_MS, 10)
+      : (fileConfig.messageBufferMs ?? 0),
     transcription: {
       model:
         process.env.WHISPER_MODEL ||

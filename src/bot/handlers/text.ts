@@ -11,28 +11,20 @@ import {
   getSessionId,
   saveSessionId,
 } from "../../user/setup.js";
+import { bufferMessage } from "../messageBuffer.js";
 
 /**
- * Handle text messages - routes to Claude
+ * Process a message (or combined messages) through Claude
  */
-export async function textHandler(ctx: Context): Promise<void> {
+export async function processMessage(
+  ctx: Context,
+  messageText: string,
+): Promise<void> {
   const config = getConfig();
   const logger = getLogger();
   const userId = ctx.from?.id;
-  const messageText = ctx.message?.text;
 
-  if (!userId || !messageText) {
-    return;
-  }
-
-  logger.debug(
-    {
-      userId,
-      username: ctx.from?.username,
-      name: ctx.from?.first_name,
-    },
-    "Message received",
-  );
+  if (!userId) return;
 
   const userDir = resolve(join(config.dataDir, String(userId)));
 
@@ -118,4 +110,28 @@ export async function textHandler(ctx: Context): Promise<void> {
       error instanceof Error ? error.message : "Unknown error";
     await ctx.reply(`An error occurred: ${errorMessage}`);
   }
+}
+
+/**
+ * Handle text messages - buffers then routes to Claude
+ */
+export async function textHandler(ctx: Context): Promise<void> {
+  const logger = getLogger();
+  const userId = ctx.from?.id;
+  const messageText = ctx.message?.text;
+
+  if (!userId || !messageText) {
+    return;
+  }
+
+  logger.debug(
+    {
+      userId,
+      username: ctx.from?.username,
+      name: ctx.from?.first_name,
+    },
+    "Message received",
+  );
+
+  await bufferMessage(ctx, messageText);
 }
