@@ -1,7 +1,8 @@
+import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Context } from "grammy";
 import { executeClaudeQuery } from "../../claude/executor.js";
-import { getConfig } from "../../config.js";
+import { getConfig, getWorkingDirectory } from "../../config.js";
 import { getLogger } from "../../logger.js";
 import { sendChunkedResponse } from "../../telegram/chunker.js";
 import { sendDownloadFiles } from "../../telegram/fileSender.js";
@@ -11,7 +12,54 @@ import {
   getSessionId,
   saveSessionId,
 } from "../../user/setup.js";
+import { drainAll } from "../../webhook/queue.js";
 import { bufferMessage } from "../messageBuffer.js";
+
+// Heartbeat file path — written on message receive and reply (lazy init)
+let _heartbeatPath: string | null = null;
+function getHeartbeatPath(): string {
+  if (!_heartbeatPath) {
+    _heartbeatPath = join(getWorkingDirectory(), ".ccpa", "heartbeat.json");
+  }
+  return _heartbeatPath;
+}
+
+interface HeartbeatState {
+  lastMessageReceived: number;
+  lastReplySent: number | null;
+  userId: number;
+  status: "processing" | "idle";
+}
+
+async function writeHeartbeat(state: HeartbeatState): Promise<void> {
+  try {
+    await writeFile(
+      getHeartbeatPath(),
+      JSON.stringify(state, null, 2),
+      "utf-8",
+    );
+  } catch {
+    // Non-fatal — don't let heartbeat failures break message handling
+  }
+}
+
+/** Format a Unix timestamp (seconds) as "h:MM AM/PM CT" */
+function formatTimestamp(unixSeconds: number): string {
+  const date = new Date(unixSeconds * 1000);
+  return (
+    date.toLocaleString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+      timeZone: "America/Chicago",
+    }) + " CT"
+  );
+}
+
+// Telegram message length limit
+const TG_MAX = 4096;
+// How often to update the streaming message (ms)
+const STREAM_UPDATE_INTERVAL = 1500;
 
 /**
  * Process a message (or combined messages) through Claude
@@ -37,29 +85,90 @@ export async function processMessage(
       return;
     }
 
+    // Write heartbeat: message received, processing
+    await writeHeartbeat({
+      lastMessageReceived: Date.now(),
+      lastReplySent: null,
+      userId,
+      status: "processing",
+    });
+
+    // Inject message timestamp into context for Claude
+    const msgDate = ctx.message?.date;
+    const timestampPrefix = msgDate
+      ? `[sent at ${formatTimestamp(msgDate)}] `
+      : "";
+    const promptText = `${timestampPrefix}${messageText}`;
+
     const sessionId = await getSessionId(userDir);
     logger.debug({ sessionId: sessionId || "new" }, "Session");
 
-    // Send initial status message
+    // Send initial status message (will be edited with streaming text)
     const statusMsg = await ctx.reply("_Processing..._", {
       parse_mode: "Markdown",
     });
-    let lastProgressUpdate = Date.now();
-    let lastProgressText = "Processing...";
+    const chatId = ctx.chat!.id;
+    const statusMsgId = statusMsg.message_id;
 
-    // Progress callback - updates status message
+    // --- Streaming state ---
+    let streamedText = "";
+    let lastStreamUpdate = 0;
+    let streamUpdatePending = false;
+    let isInToolUse = false; // True when Claude is using tools (show progress, not text)
+
+    // Flush streamed text to Telegram message
+    const flushStreamedText = async () => {
+      if (!streamedText || isInToolUse) return;
+      const now = Date.now();
+      if (now - lastStreamUpdate < STREAM_UPDATE_INTERVAL) {
+        // Schedule a deferred update if not already pending
+        if (!streamUpdatePending) {
+          streamUpdatePending = true;
+          setTimeout(
+            () => {
+              streamUpdatePending = false;
+              flushStreamedText().catch(() => {
+                // Ignore — Telegram edit errors are non-fatal
+              });
+            },
+            STREAM_UPDATE_INTERVAL - (now - lastStreamUpdate),
+          );
+        }
+        return;
+      }
+      lastStreamUpdate = now;
+      try {
+        // Show last portion if text exceeds Telegram limit (keep room for cursor)
+        const display =
+          streamedText.length > TG_MAX - 10
+            ? "..." + streamedText.slice(-(TG_MAX - 10))
+            : streamedText;
+        await ctx.api.editMessageText(chatId, statusMsgId, display + " ▍");
+      } catch {
+        // Ignore edit errors (rate limit, message not modified, etc.)
+      }
+    };
+
+    // Text streaming callback — accumulates text, triggers periodic edits
+    const onTextChunk = (fullText: string) => {
+      isInToolUse = false; // Text arrived, switch back from tool progress
+      streamedText = fullText;
+      flushStreamedText();
+    };
+
+    // Progress callback — shows tool usage (switches away from streaming text)
+    let lastProgressUpdate = Date.now();
+    let lastProgressText = "";
     const onProgress = async (message: string) => {
+      isInToolUse = true;
       const now = Date.now();
       if (now - lastProgressUpdate > 2000 && message !== lastProgressText) {
         lastProgressUpdate = now;
         lastProgressText = message;
         try {
-          await ctx.api.editMessageText(
-            ctx.chat!.id,
-            statusMsg.message_id,
-            `_${message}_`,
-            { parse_mode: "Markdown" },
-          );
+          await ctx.api.editMessageText(chatId, statusMsgId, `_${message}_`, {
+            parse_mode: "Markdown",
+          });
         } catch {
           // Ignore edit errors
         }
@@ -70,20 +179,25 @@ export async function processMessage(
 
     logger.debug("Executing Claude query");
     const result = await executeClaudeQuery({
-      prompt: messageText,
+      prompt: promptText,
       userDir,
       downloadsPath,
       sessionId,
       onProgress,
+      onTextChunk,
     });
     logger.debug(
-      { success: result.success, error: result.error },
+      {
+        success: result.success,
+        error: result.error,
+        timedOut: result.timedOut,
+      },
       "Claude result",
     );
 
-    // Delete status message
+    // Delete the streaming status message — we'll send the final response as a new message
     try {
-      await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id);
+      await ctx.api.deleteMessage(chatId, statusMsgId);
     } catch {
       // Ignore delete errors
     }
@@ -99,16 +213,42 @@ export async function processMessage(
     await sendChunkedResponse(ctx, responseText);
     logger.debug("Response sent");
 
+    // Write heartbeat: reply sent, idle
+    await writeHeartbeat({
+      lastMessageReceived: Date.now(),
+      lastReplySent: Date.now(),
+      userId,
+      status: "idle",
+    });
+
     // Send any files from downloads folder
     const filesSent = await sendDownloadFiles(ctx, userDir);
     if (filesSent > 0) {
       logger.info({ filesSent }, "Sent download files to user");
+    }
+
+    // Drain any queued webhooks now that Claude is idle
+    try {
+      await drainAll();
+    } catch (drainErr) {
+      logger.error(
+        { error: drainErr },
+        "Error draining webhook queue after message",
+      );
     }
   } catch (error) {
     logger.error({ error }, "Text handler error");
     const errorMessage =
       error instanceof Error ? error.message : "Unknown error";
     await ctx.reply(`An error occurred: ${errorMessage}`);
+
+    // Write heartbeat: error state, idle
+    await writeHeartbeat({
+      lastMessageReceived: Date.now(),
+      lastReplySent: Date.now(),
+      userId,
+      status: "idle",
+    });
   }
 }
 

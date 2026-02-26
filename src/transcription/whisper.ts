@@ -1,22 +1,15 @@
+import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
+import { promisify } from "node:util";
 import { getConfig } from "../config.js";
 import { getLogger } from "../logger.js";
 
-// Dynamic import for optional dependency
-let whisperModule: typeof import("nodejs-whisper") | null = null;
+const execAsync = promisify(exec);
 
-async function getWhisper() {
-  if (!whisperModule) {
-    try {
-      whisperModule = await import("nodejs-whisper");
-    } catch {
-      throw new Error(
-        "nodejs-whisper is not installed. Run: pnpm add nodejs-whisper",
-      );
-    }
-  }
-  return whisperModule;
-}
+const WHISPER_VENV =
+  "/home/claude/projects/ccpa-telegram/.claude/whisper/venv/bin/python";
+const WHISPER_SCRIPT =
+  "/home/claude/projects/ccpa-telegram/.claude/whisper/transcribe.py";
 
 export interface TranscriptionResult {
   text: string;
@@ -25,7 +18,7 @@ export interface TranscriptionResult {
 }
 
 /**
- * Transcribe audio file using local Whisper model
+ * Transcribe audio file using local Python Whisper (CPU-only)
  */
 export async function transcribeAudio(
   audioPath: string,
@@ -37,42 +30,31 @@ export async function transcribeAudio(
     throw new Error(`Audio file not found: ${audioPath}`);
   }
 
-  const whisper = await getWhisper();
-  const modelName = config.transcription?.model || "base.en";
+  // Map config model names (base.en) to Python whisper names (base)
+  const configModel = config.transcription?.model || "base.en";
+  const model = configModel.replace(/\.en$/, "");
 
-  logger.debug({ audioPath, model: modelName }, "Starting transcription");
+  logger.debug({ audioPath, model }, "Starting transcription");
 
   const startTime = Date.now();
 
   try {
-    const transcript = await whisper.nodewhisper(audioPath, {
-      modelName,
-      autoDownloadModelName: modelName,
-      removeWavFileAfterTranscription: false,
-      withCuda: false,
-      whisperOptions: {
-        outputInText: true,
-        language: "auto",
-      },
-      logger: {
-        debug: (message: string) => logger.debug(message),
-        error: (message: string) => logger.error(message),
-        log: (message: string) => logger.info(message),
-      },
-    });
+    const { stdout } = await execAsync(
+      `"${WHISPER_VENV}" "${WHISPER_SCRIPT}" "${audioPath}" --model ${model} --json`,
+      { timeout: 120000 },
+    );
 
     const duration = (Date.now() - startTime) / 1000;
-    const text = Array.isArray(transcript)
-      ? transcript.map((t) => t.speech).join(" ")
-      : String(transcript);
+    const result = JSON.parse(stdout.trim());
 
     logger.debug(
-      { duration: `${duration.toFixed(2)}s`, textLength: text.length },
+      { duration: `${duration.toFixed(2)}s`, textLength: result.text.length },
       "Transcription complete",
     );
 
     return {
-      text: text.trim(),
+      text: result.text,
+      language: result.language,
       duration,
     };
   } catch (error) {

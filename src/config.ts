@@ -64,6 +64,8 @@ const ConfigSchema = z.object({
     command: z.string().default("claude"),
   }),
   messageBufferMs: z.number().nonnegative().default(0),
+  claudeTimeoutSeconds: z.number().positive().default(600).optional(),
+  webhookPort: z.number().positive().default(9099).optional(),
   transcription: z
     .object({
       model: TranscriptionModelSchema.default("base.en"),
@@ -108,6 +110,8 @@ const ConfigFileSchema = z
       .partial()
       .optional(),
     messageBufferMs: z.number().nonnegative().optional(),
+    claudeTimeoutSeconds: z.number().positive().optional(),
+    webhookPort: z.number().positive().optional(),
     transcription: z
       .object({
         model: TranscriptionModelSchema.default("base.en"),
@@ -197,6 +201,12 @@ export function loadConfig(): Config {
     messageBufferMs: process.env.MESSAGE_BUFFER_MS
       ? parseInt(process.env.MESSAGE_BUFFER_MS, 10)
       : (fileConfig.messageBufferMs ?? 0),
+    claudeTimeoutSeconds: process.env.CLAUDE_TIMEOUT_SECONDS
+      ? parseInt(process.env.CLAUDE_TIMEOUT_SECONDS, 10)
+      : (fileConfig.claudeTimeoutSeconds ?? 600),
+    webhookPort: process.env.WEBHOOK_PORT
+      ? parseInt(process.env.WEBHOOK_PORT, 10)
+      : (fileConfig.webhookPort ?? 9099),
     transcription: {
       model:
         process.env.WHISPER_MODEL ||

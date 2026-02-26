@@ -8,6 +8,7 @@ export interface ExecuteOptions {
   downloadsPath?: string;
   sessionId?: string | null;
   onProgress?: (message: string) => void;
+  onTextChunk?: (fullText: string) => void;
 }
 
 export interface ExecuteResult {
@@ -15,6 +16,14 @@ export interface ExecuteResult {
   output: string;
   sessionId?: string;
   error?: string;
+  timedOut?: boolean;
+}
+
+// --- Busy lock ---
+let _busy = false;
+
+export function isClaudeBusy(): boolean {
+  return _busy;
 }
 
 /**
@@ -23,8 +32,13 @@ export interface ExecuteResult {
 export async function executeClaudeQuery(
   options: ExecuteOptions,
 ): Promise<ExecuteResult> {
-  const { prompt, downloadsPath, sessionId, onProgress } = options;
+  _busy = true;
+  const { prompt, downloadsPath, sessionId, onProgress, onTextChunk } = options;
   const logger = getLogger();
+  const config = getConfig();
+
+  // Inactivity timeout: kill process if no stdout/stderr data for this long (default 10 min)
+  const inactivityTimeoutMs = (config.claudeTimeoutSeconds ?? 600) * 1000;
 
   // Append downloads path info to prompt if provided
   const fullPrompt = downloadsPath
@@ -44,11 +58,16 @@ export async function executeClaudeQuery(
     args.push("--resume", sessionId);
   }
 
-  const claudeCommand = getConfig().claude.command;
+  const claudeCommand = config.claude.command;
   const cwd = getWorkingDirectory();
   logger.info({ command: claudeCommand, args, cwd }, "Executing Claude CLI");
 
-  return new Promise((resolve) => {
+  return new Promise<ExecuteResult>((rawResolve) => {
+    const resolve = (result: ExecuteResult) => {
+      _busy = false;
+      rawResolve(result);
+    };
+
     const proc = spawn(claudeCommand, args, {
       cwd,
       env: process.env,
@@ -59,8 +78,38 @@ export async function executeClaudeQuery(
     let lastResult: ExecuteResult | null = null;
     let currentSessionId: string | undefined;
     let lastAssistantText = ""; // Track last text response for fallback
+    let killed = false;
+
+    // --- Inactivity timeout ---
+    let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const resetInactivityTimer = () => {
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(() => {
+        logger.warn(
+          { timeoutMs: inactivityTimeoutMs, sessionId: currentSessionId },
+          "Claude process inactivity timeout — killing stalled process",
+        );
+        killed = true;
+        proc.kill("SIGTERM");
+        // Force kill after 10s if SIGTERM doesn't work
+        setTimeout(() => {
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            /* already dead */
+          }
+        }, 10000);
+      }, inactivityTimeoutMs);
+    };
+
+    // Start the timer
+    resetInactivityTimer();
 
     proc.stdout.on("data", (data: Buffer) => {
+      // Reset inactivity timer on any stdout data
+      resetInactivityTimer();
+
       const chunk = data.toString();
 
       // Parse streaming JSON lines
@@ -82,9 +131,12 @@ export async function executeClaudeQuery(
           // Extract text from assistant messages and send progress updates
           if (event.type === "assistant" && event.message?.content) {
             for (const block of event.message.content) {
-              // Capture text content for fallback
+              // Capture text content for fallback and streaming
               if (block.type === "text" && block.text) {
                 lastAssistantText = block.text;
+                if (onTextChunk) {
+                  onTextChunk(block.text);
+                }
               }
 
               // Send progress updates for tool usage
@@ -161,6 +213,9 @@ export async function executeClaudeQuery(
     });
 
     proc.stderr.on("data", (data: Buffer) => {
+      // stderr activity also resets the timer
+      resetInactivityTimer();
+
       const chunk = data.toString().trim();
       if (chunk) {
         stderrOutput += `${chunk}\n`;
@@ -169,9 +224,21 @@ export async function executeClaudeQuery(
     });
 
     proc.on("close", (code) => {
-      logger.debug({ code }, "Claude process closed");
+      // Clear the inactivity timer
+      if (inactivityTimer) clearTimeout(inactivityTimer);
 
-      if (lastResult) {
+      logger.debug({ code, killed }, "Claude process closed");
+
+      if (killed) {
+        resolve({
+          success: false,
+          output: lastAssistantText,
+          sessionId: currentSessionId,
+          error:
+            "Session timed out (no activity). Send another message to retry.",
+          timedOut: true,
+        });
+      } else if (lastResult) {
         if (!lastResult.success) {
           logger.error(
             {
@@ -206,6 +273,9 @@ export async function executeClaudeQuery(
     });
 
     proc.on("error", (err) => {
+      // Clear the inactivity timer
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+
       logger.error({ error: err.message }, "Claude process error");
       resolve({
         success: false,

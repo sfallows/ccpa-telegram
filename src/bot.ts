@@ -15,6 +15,8 @@ import { authMiddleware } from "./bot/middleware/auth.js";
 import { rateLimitMiddleware } from "./bot/middleware/rateLimit.js";
 import { getConfig, getWorkingDirectory } from "./config.js";
 import { getLogger, initLogger } from "./logger.js";
+import { startQueuePoller, stopQueuePoller } from "./webhook/queue.js";
+import { startWebhookServer } from "./webhook/server.js";
 
 /**
  * Check if the Claude CLI command is available
@@ -73,6 +75,13 @@ export async function startBot(): Promise<void> {
   bot.command("help", helpHandler);
   bot.command("clear", clearHandler);
 
+  // /compact — pass through to Claude as a regular message so it triggers compaction
+  bot.command("compact", async (ctx) => {
+    const text =
+      "Please run /compact now to compress the conversation context.";
+    await processMessage(ctx, text);
+  });
+
   // Text message handler
   bot.on("message:text", textHandler);
 
@@ -93,6 +102,7 @@ export async function startBot(): Promise<void> {
   // Graceful shutdown
   async function shutdown(signal: string): Promise<void> {
     logger.info({ signal }, "Received shutdown signal");
+    stopQueuePoller();
     await bot.stop();
     logger.info("Bot stopped");
     process.exit(0);
@@ -100,6 +110,28 @@ export async function startBot(): Promise<void> {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  // Start webhook server for external triggers (n8n, GitHub, etc.)
+  startWebhookServer(bot);
+
+  // Start queue poller for processing queued webhooks
+  await startQueuePoller(bot);
+
+  // Register bot commands with Telegram (shows autocomplete menu)
+  try {
+    await bot.api.setMyCommands([
+      { command: "start", description: "Welcome message" },
+      { command: "help", description: "Show help" },
+      { command: "clear", description: "Clear conversation history" },
+      { command: "compact", description: "Compress conversation context" },
+    ]);
+    logger.info("Telegram bot commands registered");
+  } catch (err) {
+    logger.warn(
+      { error: err },
+      "Failed to register bot commands with Telegram",
+    );
+  }
 
   // Start bot
   logger.info(
