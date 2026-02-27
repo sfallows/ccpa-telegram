@@ -11,8 +11,8 @@ import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { Bot } from "grammy";
-import { getConfig, getWorkingDirectory } from "../config.js";
 import { isClaudeBusy } from "../claude/executor.js";
+import { getConfig, getWorkingDirectory } from "../config.js";
 import { getLogger } from "../logger.js";
 
 // --- Types ---
@@ -143,7 +143,12 @@ export async function drainNotification(): Promise<boolean> {
   if (!row) return false;
 
   logger.info(
-    { notifId: row.id, priority: row.priority, source: row.source, attempt: row.attempts },
+    {
+      notifId: row.id,
+      priority: row.priority,
+      source: row.source,
+      attempt: row.attempts,
+    },
     "Draining notification",
   );
 
@@ -154,10 +159,7 @@ export async function drainNotification(): Promise<boolean> {
     }
 
     stmtMarkSent!.run(row.id);
-    logger.info(
-      { notifId: row.id, source: row.source },
-      "Notification sent",
-    );
+    logger.info({ notifId: row.id, source: row.source }, "Notification sent");
     return true;
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
@@ -165,13 +167,23 @@ export async function drainNotification(): Promise<boolean> {
     if (row.attempts >= row.max_attempts) {
       stmtMarkFailed!.run(errorMsg, row.id);
       logger.error(
-        { notifId: row.id, source: row.source, attempts: row.attempts, error: errorMsg },
+        {
+          notifId: row.id,
+          source: row.source,
+          attempts: row.attempts,
+          error: errorMsg,
+        },
         "Notification failed permanently",
       );
     } else {
       stmtRequeue!.run(errorMsg, row.id);
       logger.warn(
-        { notifId: row.id, source: row.source, attempts: row.attempts, error: errorMsg },
+        {
+          notifId: row.id,
+          source: row.source,
+          attempts: row.attempts,
+          error: errorMsg,
+        },
         "Notification requeued for retry",
       );
     }
@@ -209,16 +221,24 @@ export async function startNotificationPoller(bot: Bot): Promise<void> {
   // Recovery: reset stuck "processing" items from previous crash
   try {
     const database = ensureDb();
-    const result = database.prepare(`
+    const result = database
+      .prepare(`
       UPDATE notifications SET status = 'pending'
       WHERE status = 'processing'
-    `).run();
+    `)
+      .run();
     if (result.changes > 0) {
-      logger.info({ recovered: result.changes }, "Reset stuck notification items to pending");
+      logger.info(
+        { recovered: result.changes },
+        "Reset stuck notification items to pending",
+      );
     }
     const pending = stmtPendingCount!.get() as { count: number };
     if (pending.count > 0) {
-      logger.info({ pending: pending.count }, "Notification items pending on startup");
+      logger.info(
+        { pending: pending.count },
+        "Notification items pending on startup",
+      );
     }
   } catch {
     logger.debug("Notifications DB not found on startup — will check on poll");
@@ -237,7 +257,10 @@ export async function startNotificationPoller(bot: Bot): Promise<void> {
     }
   }, POLL_INTERVAL_MS);
 
-  logger.info({ intervalMs: POLL_INTERVAL_MS }, "Notification queue poller started");
+  logger.info(
+    { intervalMs: POLL_INTERVAL_MS },
+    "Notification queue poller started",
+  );
 }
 
 export function stopNotificationPoller(): void {
@@ -246,7 +269,11 @@ export function stopNotificationPoller(): void {
     pollTimer = null;
   }
   if (db) {
-    try { db.close(); } catch { /* ignore */ }
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
     db = null;
   }
 }
