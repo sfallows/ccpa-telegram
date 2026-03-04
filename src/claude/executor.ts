@@ -207,7 +207,7 @@ export async function executeClaudeQuery(
               : undefined;
             lastResult = {
               success: !event.is_error,
-              output: event.result || "",
+              output: event.result || lastAssistantText || "",
               sessionId: event.session_id || currentSessionId,
               error: errorMessage,
             };
