@@ -343,8 +343,6 @@ export async function textHandler(ctx: Context): Promise<void> {
     "Message received",
   );
 
-  await bufferMessage(ctx, messageText);
-  // Intercept /login and /login <code> before passing to Claude
   const trimmed = messageText.trim();
   if (trimmed === "/login" || trimmed.startsWith("/login ")) {
     const args = trimmed.startsWith("/login ") ? trimmed.slice(7).trim() : "";
@@ -369,4 +367,6 @@ export async function textHandler(ctx: Context): Promise<void> {
     }
     return;
   }
+
+  await bufferMessage(ctx, messageText);
 }
